@@ -2,6 +2,8 @@
 
 A plugin for PouchDB which allows a remote PouchDB instance to be used locally. It transfers data over WebRTC, for simple lower-latency remote access and even particularly peer-to-peer replication!
 
+This is an attempt to get PeerPouch working for me
+
 ## API
 
 To set up a peer connection, you actually need to start with a centralized database — this hub is first used for signalling connection parameters, and *then* the connection can be used to exchange messages.
