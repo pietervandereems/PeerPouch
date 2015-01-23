@@ -1,23 +1,185 @@
-/*jslint nomen: true, browser: true, todo:true*/
-/*globals Pouch: true, call: false, FileReader: true, Blob:true*/
-/*globals require: false, console: false */
+/*jslint nomen: true, browser:true, todo:true*/
+/*globals PouchDB, Blob, FileReader*/
 
 "use strict";
 
-// a couple additional errors we use
-Pouch.Errors.NOT_IMPLEMENTED = {status: 501, error: 'not_implemented', reason: "Unable to fulfill the request"};       // [really for METHODs only?]
-Pouch.Errors.FORBIDDEN = {status: 403, error: 'forbidden', reason: "The request was refused"};
-
-
-var PeerPouch, // local functions
+var PeerPouch,
     RPCHandler,
-    SharePouch;
+    _t;
+
+// a couple additional errors we use
+PouchDB.Errors.NOT_IMPLEMENTED = {
+    status: 501,
+    error: 'not_implemented',
+    reason: "Unable to fulfill the request"
+};       // [really for METHODs only?]
+
+PouchDB.Errors.FORBIDDEN = {
+    status: 403,
+    error: 'forbidden',
+    reason: "The request was refused"
+};
+
+RPCHandler = function (tube) {
+    var blobsForNextCall,
+        _isBlob;
+
+    _isBlob = function (obj) {
+        var type = Object.prototype.toString.call(obj);
+        return (type === '[object Blob]' || type === '[object File]');
+    };
+
+    this.onbootstrap = null;        // caller MAY provide this
+
+    this._exposed_fns = Object.create(null);
+    this.serialize = function (obj) {
+        var messages = [];
+        /*jslint unparam:true*/
+        messages.push(JSON.stringify(obj, function (k, v) {
+            var id,
+                n;
+            if (typeof v === 'function') {
+                id = Math.random().toFixed(20).slice(2);
+                this._exposed_fns[id] = v;
+                return {
+                    __remote_fn: id
+                };
+            }
+            if (Object.prototype.toString.call(v) === '[object IDBTransaction]') {
+                // HACK: pouch.idb.js likes to bounce a ctx object around but if we null it out it recreates
+                // c.f. https://github.com/daleharvey/pouchdb/commit/e7f66a02509bd2a9bd12369c87e6238fadc13232
+                return;
+
+                // TODO: the WebSQL adapter also does this but does NOT create a new transaction if it's missing :-(
+                // https://github.com/daleharvey/pouchdb/blob/80514c7d655453213f9ca7113f327424969536c4/src/adapters/pouch.websql.js#L646
+                // so we'll have to either get that fixed upstream or add remote object references (but how to garbage collect? what if local uses?!)
+            }
+            if (_isBlob(v)) {
+                n = messages.indexOf(v) + 1;
+                if (!n) {
+                    n = messages.push(v);
+                }
+                return {
+                    __blob: n
+                };
+            }
+            return v;
+        }.bind(this)));
+        /*jslint unparam: false*/
+        return messages;
+    };
+
+    blobsForNextCall = [];                  // each binary object is sent before the function call message
+    this.deserialize = function (data) {
+        if (typeof data === 'string') {
+            /*jslint unparam:true*/
+            return JSON.parse(data, function (k, v) {
+                var b;
+                if (v && v.__remote_fn) {
+                    return function () {
+                        this._callRemote(v.__remote_fn, arguments);
+                    }.bind(this);
+                }
+                if (v && v.__blob) {
+                    b = blobsForNextCall[v.__blob - 1];
+                    if (!_isBlob(b)) {
+                        b = new Blob([b]);       // `b` may actually be an ArrayBuffer
+                    }
+                    return b;
+                }
+                return v;
+            }.bind(this));
+            /*jslint unparam:false*/
+            // blobsForNextCall.length = 0;  Unreachable after all these returns;
+        }
+        blobsForNextCall.push(data);
+    };
+
+    this._callRemote = function (fn, args) {
+        var processNext,
+            messages;
+
+        messages = this.serialize({
+            fn: fn,
+            args: Array.prototype.slice.call(args)
+        });
+
+        // WORKAROUND: Chrome (as of M32) cannot send a Blob, only an ArrayBuffer. So we send each once converted…
+        processNext = function () {
+            var msg = messages.shift(),
+                reader;
+            if (!msg) {
+                return;
+            }
+            if (_isBlob(msg)) {
+                reader = new FileReader();
+                reader.readAsArrayBuffer(msg);
+                reader.onload = function () {
+                    tube.send(reader.result);
+                    processNext();
+                };
+            } else {
+                tube.send(msg);
+                processNext();
+            }
+        };
+        if (window.mozRTCPeerConnection) {
+            messages.forEach(function (msg) { tube.send(msg); });
+        } else {
+            processNext();
+        }
+    };
+
+    this._exposed_fns['__BOOTSTRAP__'] = function () {
+        if (this.onbootstrap) {
+            this.onbootstrap.apply(this, arguments);
+        }
+    }.bind(this);
+
+    tube.onmessage = function (evt) {
+        var call = this.deserialize(evt.data),
+            fn;
+        if (!call) {
+            return;      //
+        }
+
+        fn = this._exposed_fns[call.fn];
+        if (!fn) {
+            console.warn("RPC call to unknown local function", call);
+            return;
+        }
+
+        // leak only callbacks which are marked for keeping (most are one-shot)
+        if (!fn._keep_exposed) {
+            delete this._exposed_fns[call.fn];
+        }
+
+        try {
+//console.log("Calling RPC", fn, call.args);
+            fn.apply(null, call.args);
+        } catch (e) {           // we do not signal exceptions remotely
+            console.warn("Local RPC invocation unexpectedly threw:", e);
+        }
+    }.bind(this);
+};
+
+RPCHandler.prototype.bootstrap = function () {
+    this._callRemote('__BOOTSTRAP__', arguments);
+};
 
 // Implements the API for dealing with a PouchDB peer's database over WebRTC
 PeerPouch = function (opts, callback) {
     var _init,
         handler,
-        api;
+        api,
+        TODO;
+
+    TODO = function (callback) {
+        // TODO: callers of this function want implementations
+        if (callback) {
+            setTimeout(function () { callback(PouchDB.Errors.NOT_IMPLEMENTED); }, 0);
+        }
+    };
 
     _init = PeerPouch._shareInitializersByName[opts.name];
     if (!_init) {
@@ -33,15 +195,19 @@ PeerPouch = function (opts, callback) {
             var rpcAPI = d.api;
 
             // simply hook up each [proxied] remote method as our own local implementation
-            Object.keys(rpcAPI).forEach(function (k) { api[k] = rpcAPI[k]; });
+            Object.keys(rpcAPI).forEach(function (key) {
+                api[key] = rpcAPI[key];
+            });
 
             // one override to provide a synchronous `.cancel()` helper locally
             api._changes = function (opts) {
+                var cancelRemotely,
+                    cancelledLocally;
                 if (opts.onChange) {
                     opts.onChange._keep_exposed = true;      // otherwise the RPC mechanism tosses after one use
                 }
-                var cancelRemotely = null,
-                    cancelledLocally = false;
+                cancelRemotely = null;
+                cancelledLocally = false;
                 rpcAPI._changes(opts, function (rpcCancel) {
                     if (cancelledLocally) {
                         rpcCancel();
@@ -63,14 +229,20 @@ PeerPouch = function (opts, callback) {
                 };
             };
 
+//            api._id = function () {
+//                // TODO: does this need to be "mangled" to distinguish it from the real copy?
+//                //       [it seems unnecessary: a replication with "api" is a replication with "rpcAPI"]
+//                return rpcAPI._id;
+//            };
+//             api._id = pouchdb.utils.topromise(function (callback) {
+//                 callback(null, rpcapi._id);
+//             });
             api._id = function () {
-                // TODO: does this need to be "mangled" to distinguish it from the real copy?
-                //       [it seems unnecessary: a replication with "api" is a replication with "rpcAPI"]
-                return rpcAPI._id;
+                return PouchDB.utils.Promise.resolve(rpcAPI._id);
             };
 
             // now our api object is *actually* ready for use
-            if (typeof callback === 'function') {
+            if (callback) {
                 callback(null, api);
             }
         };
@@ -80,25 +252,33 @@ PeerPouch = function (opts, callback) {
 };
 
 PeerPouch._wrappedAPI = function (db) {
-    var rpcAPI,
-        methods;
     /*
         This object will be sent over to the remote peer. So, all methods on it must be:
         - async-only (all "communication" must be via callback, not exceptions or return values)
         - secure (peer could provide untoward arguments)
     */
-    rpcAPI = {};
-
+    var rpcAPI = {},
     /*
         This lists the core "customApi" methods that are expected by pouch.adapter.js
     */
-    methods = ['bulkDocs', '_getRevisionTree', '_doCompaction', '_get', '_getAttachment', '_allDocs', '_changes', '_close', '_info', '_id'];
+        methods = [
+            'bulkDocs',
+            '_getRevisionTree',
+            '_doCompaction',
+            '_get',
+            '_getAttachment',
+            '_allDocs',
+            '_changes',
+            '_close',
+            '_info',
+            '_id'
+        ];
 
     // most methods can just be proxied directly
-    methods.forEach(function (k) {
-        rpcAPI[k] = db[k];
-        if (rpcAPI[k]) {
-            rpcAPI[k]._keep_exposed = true;
+    methods.forEach(function (method) {
+        rpcAPI[method] = db[method];
+        if (rpcAPI[method]) {
+            rpcAPI[method]._keep_exposed = true;
         }
     });
 
@@ -107,6 +287,7 @@ PeerPouch._wrappedAPI = function (db) {
         var retval = db._changes(opts);
         rpcCB(retval.cancel);
     };
+
     rpcAPI._changes._keep_exposed = true;
 
     // just send the local result
@@ -119,7 +300,7 @@ PeerPouch._wrappedAPI = function (db) {
 /*jslint unparam:true*/
 PeerPouch.destroy = function (name, callback) {
     if (callback) {
-        setTimeout(function () { callback(Pouch.Errors.FORBIDDEN); }, 0);
+        setTimeout(function () { callback(PouchDB.Errors.FORBIDDEN); }, 0);
     }
 };
 /*jslint unparam:false*/
@@ -137,10 +318,10 @@ PeerPouch._types = {
     share: 'com.stemstorage.peerpouch.share'
 };
 
-var _t = PeerPouch._types;         // local alias for brevitation…
+_t = PeerPouch._types;         // local alias for brevitation…
 
 // Register for our scheme
-Pouch.adapter('webrtc', PeerPouch);
+PouchDB.adapter('webrtc', PeerPouch);
 
 
 var RTCPeerConnection = window.mozRTCPeerConnection || window.RTCPeerConnection || window.webkitRTCPeerConnection,
@@ -281,10 +462,7 @@ PeerConnectionHandler.prototype._setupChannel = function (evt) {
             console.log(handler.LOG_SELF, "received message!", evt);
         }
         if (handler.onreceivemessage) {
-            handler.onreceivemessage({
-                target: handler,
-                data: evt.data
-            });
+            handler.onreceivemessage({target: handler, data: evt.data});
         }
     };
     if (window.mozRTCPeerConnection) {
@@ -310,204 +488,62 @@ PeerConnectionHandler.prototype._tube = function () {      // TODO: refactor Pee
     return tube;
 };
 
-RPCHandler = function (tube) {
-    var blobsForNextCall = [],                  // each binary object is sent before the function call message
-        _isBlob;
 
-    this.onbootstrap = null;        // caller MAY provide this
-
-    this._exposed_fns = Object.create(null);
-
-    _isBlob = function (obj) {
-        var type = Object.prototype.toString.call(obj);
-        return (type === '[object Blob]' || type === '[object File]');
-    };
-
-    this.serialize = function (obj) {
-        var messages = [];
-        /*jslint unparam:true*/
-        messages.push(JSON.stringify(obj, function (k, v) {
-            var id,
-                n;
-            if (typeof v === 'function') {
-                id = Math.random().toFixed(20).slice(2);
-                this._exposed_fns[id] = v;
-                return {
-                    __remote_fn: id
-                };
-            }
-            if (Object.prototype.toString.call(v) === '[object IDBTransaction]') {
-                // HACK: pouch.idb.js likes to bounce a ctx object around but if we null it out it recreates
-                // c.f. https://github.com/daleharvey/pouchdb/commit/e7f66a02509bd2a9bd12369c87e6238fadc13232
-                return;
-
-                // TODO: the WebSQL adapter also does this but does NOT create a new transaction if it's missing :-(
-                // https://github.com/daleharvey/pouchdb/blob/80514c7d655453213f9ca7113f327424969536c4/src/adapters/pouch.websql.js#L646
-                // so we'll have to either get that fixed upstream or add remote object references (but how to garbage collect? what if local uses?!)
-            }
-            if (_isBlob(v)) {
-                n = messages.indexOf(v) + 1;
-                if (!n) {
-                    n = messages.push(v);
-                }
-                return {
-                    __blob: n
-                };
-            }
-            return v;
-        }.bind(this)));
-        /*jslint unparam:false*/
-        return messages;
-    };
-
-    this.deserialize = function (data) {
-        if (typeof data === 'string') {
-            return JSON.parse(data, function (k, v) {
-                var b;
-                if (v && v.__remote_fn) {
-                    return function () {
-                        this._callRemote(v.__remote_fn, arguments);
-                    }.bind(this);
-                }
-                if (v && v.__blob) {
-                    b = blobsForNextCall[v.__blob - 1];
-                    if (!_isBlob(b)) {
-                        b = new Blob([b]);       // `b` may actually be an ArrayBuffer
-                    }
-                    return b;
-                }
-                return v;
-            }.bind(this));
-
-            //blobsForNextCall.length = 0; This code will never be execute
-        }
-        blobsForNextCall.push(data);
-    };
-
-
-    this._callRemote = function (fn, args) {
-//console.log("Serializing RPC", fn, args);
-        var messages = this.serialize({
-                fn: fn,
-                args: Array.prototype.slice.call(args)
-            }),
-            processNext;
-        // WORKAROUND: Chrome (as of M32) cannot send a Blob, only an ArrayBuffer. So we send each once converted…
-        processNext = function () {
-            var msg = messages.shift(),
-                r;
-            if (!msg) {
-                return;
-            }
-            if (_isBlob(msg)) {
-                r = new FileReader();
-                r.readAsArrayBuffer(msg);
-                r.onload = function () {
-                    tube.send(r.result);
-                    processNext();
-                };
-            } else {
-                tube.send(msg);
-                processNext();
-            }
-        };
-
-        if (window.mozRTCPeerConnection) {
-            messages.forEach(function (msg) { tube.send(msg); });
-        } else {
-            processNext();
-        }
-    };
-
-    this._exposed_fns.__BOOTSTRAP__ = function () {
-        if (this.onbootstrap) {
-            this.onbootstrap.apply(this, arguments);
-        }
-    }.bind(this);
-
-    tube.onmessage = function (evt) {
-        var call = this.deserialize(evt.data),
-            fn;
-
-        if (!call) {
-            return;
-        }
-
-        fn = this._exposed_fns[call.fn];
-        if (!fn) {
-            console.warn("RPC call to unknown local function", call);
-            return;
-        }
-
-        // leak only callbacks which are marked for keeping (most are one-shot)
-        if (!fn._keep_exposed) {
-            delete this._exposed_fns[call.fn];
-        }
-
-        try {
-//console.log("Calling RPC", fn, call.args);
-            fn.apply(null, call.args);
-        } catch (e) {           // we do not signal exceptions remotely
-            console.warn("Local RPC invocation unexpectedly threw: " + e, e);
-        }
-    }.bind(this);
-};
-
-RPCHandler.prototype.bootstrap = function () {
-    this._callRemote('__BOOTSTRAP__', arguments);
-};
-
-SharePouch = function (hub) {
+var SharePouch = function () {
     // NOTE: this plugin's methods are intended for use only on a **hub** database
 
     // this chunk of code manages a combined _changes listener on hub for any share/signal(/etc.) watchers
     var watcherCount = 0,         // easier to refcount than re-count!
-        watchersByType = Object.create(null),
+        watchersByType = {},
         changesListener = null,
-        sharesByRemoteId = Object.create(null),         // ._id of share doc
-        sharesByLocalId = Object.create(null),            // .id() of database
-        addWatcher,
+        sharesByRemoteId = {},         // ._id of share doc
+        sharesByLocalId = {},            // .id() of database
+        addWatcher,     // internal functions
         removeWatcher,
-        share,
-        unshare,
         _localizeShare,
         _isLocal,
+        share,          // 'exported' functions
+        unshare,
         getShares;
 
     addWatcher = function (type, cb) {
-        var watchers = watchersByType[type] || [],
-            cancelListen;
+        var watchers,
+            cancelListen,
+            that = this;
 
-        if (!watchersByType[type]) {
-            watchersByType[type] = [];
-        }
+        watchersByType[type] = watchersByType[type] || [];
+        watchers = watchersByType[type];
         watchers.push(cb);
         watcherCount += 1;
+
         if (watcherCount > 0 && !changesListener) {         // start listening for changes (at current sequence)
             cancelListen = false;
             changesListener = {
-                cancel: function () { cancelListen = true; }
+                cancel: function () {
+                    cancelListen = true;
+                }
             };
-            hub.info(function (e, d) {
-                var opts = {
+            that.info(function (err, info) {
+                var opts;
+                if (err) {
+                    throw new Error(err);
+                }
+                opts = {
                     //filter: _t.ddoc_name+'/signalling',             // see https://github.com/daleharvey/pouchdb/issues/525
                     include_docs: true,
                     continuous: true,
-                    since: d.update_seq
+                    since: info.update_seq
                 };
-                if (e) {
-                    throw e;
-                }
-                opts.onChange = function (d) {
-                    var owatchers = watchersByType[d.doc.type];
-                    if (owatchers) {
-                        owatchers.forEach(function (cb) {
-                            cb(d.doc);
+                opts.onChange = function (change) {
+                    var watchersOnChange = watchersByType[change.doc.type];
+                    if (watchersOnChange) {
+                        watchersOnChange.forEach(function (cb) {
+                            cb(change.doc);
                         });
                     }
                 };
                 if (!cancelListen) {
-                    changesListener = hub.changes(opts);
+                    changesListener = that.changes(opts);
                 } else {
                     changesListener = null;
                 }
@@ -534,14 +570,9 @@ SharePouch = function (hub) {
     };
 
     share = function (db, opts, cb) {
-        var shareVar = {
-                _id: 'share-' + Pouch.uuid(),
-                type: _t.share,
-                name: opts.name || null,
-                info: opts.info || null
-            },
-            peerHandlers = Object.create(null);
-
+        var shareObj,
+            peerHandlers,
+            that = this;
         if (typeof opts === 'function') {
             cb = opts;
             opts = {};
@@ -549,42 +580,46 @@ SharePouch = function (hub) {
             opts = opts || {};
         }
 
-        hub.post(shareVar, function (e, d) {
-            if (!e) {
-                shareVar._rev = d.rev;
+        shareObj = {
+            _id: 'share-' + PouchDB.utils.uuid(),
+            type: _t.share,
+            name: opts.name || null,
+            info: opts.info || null
+        };
+
+        that.post(shareObj, function (err, doc) {
+            if (!err) {
+                shareObj._rev = doc.rev;
             }
             if (cb) {
-                cb(e, d);
+                cb(err, doc);
             }
         });
 
-        shareVar._signalWatcher = addWatcher(_t.signal, function receiveSignal(signal) {
-            if (signal.recipient !== shareVar._id) {
-                return;
-            }
-
-            var self = shareVar._id,
+        peerHandlers = Object.create(null);
+        shareObj._signalWatcher = addWatcher.call(that, _t.signal, function receiveSignal(signal) {
+            var self = shareObj._id,
                 peer = signal.sender,
                 info = signal.info,
                 handler = peerHandlers[peer];
 
+            if (signal.recipient !== shareObj._id) {
+                return;
+            }
+
             if (!handler) {
-                handler = peerHandlers[peer] = new PeerConnectionHandler({
-                    initiate: false,
-                    _self: self,
-                    _peer: peer
-                });
+                handler = peerHandlers[peer] = new PeerConnectionHandler({initiate: false, _self: self, _peer: peer});
                 handler.onhavesignal = function sendSignal(evt) {
-                    hub.post({
-                        _id: 's-signal-' + Pouch.uuid(),
+                    that.post({
+                        _id: 's-signal-' + PouchDB.utils.uuid(),
                         type: _t.signal,
                         sender: self,
                         recipient: peer,
                         data: evt.signal,
-                        info: shareVar.info
-                    }, function (e) {
-                        if (e) {
-                            throw e;
+                        info: shareObj.info
+                    }, function (err) {
+                        if (err) {
+                            throw new Error(err);
                         }
                     });
                 };
@@ -610,74 +645,84 @@ SharePouch = function (hub) {
                 };
             }
             handler.receiveSignal(signal.data);
-            hub.post({
+            that.post({
                 _id: signal._id,
                 _rev: signal._rev,
                 _deleted: true
-            }, function (e) {
-                if (e) {
-                    console.warn("Couldn't clean up signal", e);
+            }, function (err) {
+                if (err) {
+                    console.warn("Couldn't clean up signal", err);
                 }
             });
         });
-        sharesByRemoteId[shareVar._id] = sharesByLocalId[db.id()] = share;
+        sharesByRemoteId[shareObj._id] = sharesByLocalId[db.id()] = shareObj;
     };
 
     unshare = function (db, cb) {            // TODO: call this automatically from _delete hook whenever it sees a previously shared db?
-        var shareVar = sharesByLocalId[db.id()];
-        if (!shareVar) {
-            return cb && setTimeout(function () {
-                cb(new Error("Database is not currently shared"));
-            }, 0);
+        var shareloc = sharesByLocalId[db.id()];
+        if (!shareloc) {
+            if (typeof cb === 'function') {
+                return setTimeout(function () {
+                    cb(new Error("Database is not currently shared"));
+                }, 0);
+            }
+            return false;
         }
-        hub.post({
-            _id: shareVar._id,
-            _rev: shareVar._rev,
+        this.post({
+            _id: shareloc._id,
+            _rev: shareloc._rev,
             _deleted: true
         }, cb);
-        shareVar._signalWatcher.cancel();
-        delete sharesByRemoteId[shareVar._id];
+        shareloc._signalWatcher.cancel();
+        delete sharesByRemoteId[shareloc._id];
         delete sharesByLocalId[db.id()];
     };
 
     _localizeShare = function (doc) {
-        var name = [hub.id(), doc._id].map(encodeURIComponent).join('/');
+        var name = [this.id(), doc._id].map(encodeURIComponent).join('/'),
+            that = this;
+
         if (doc._deleted) {
             delete PeerPouch._shareInitializersByName[name];
         } else {
             PeerPouch._shareInitializersByName[name] = function (opts) {
-                var client = 'peer-' + Pouch.uuid(),
-                    shareVar = doc._id,
-                    handler = new PeerConnectionHandler({initiate: true, _self: client, _peer: shareVar});
+                var client = 'peer-' + PouchDB.utils.uuid(),
+                    shareloc = doc._id,
+                    handler = new PeerConnectionHandler({
+                        initiate: true,
+                        _self: client,
+                        _peer: shareloc
+                    });
                 handler.onhavesignal = function sendSignal(evt) {
-                    hub.post({
-                        _id: 'p-signal-' + Pouch.uuid(),
+                    that.post({
+                        _id: 'p-signal-' + PouchDB.utils.uuid(),
                         type: _t.signal,
                         sender: client,
-                        recipient: shareVar,
+                        recipient: shareloc,
                         data: evt.signal,
                         info: opts.info
-                    }, function (e) {
-                        if (e) {
-                            throw e;
+                    }, function (err) {
+                        if (err) {
+                            throw new Error(err);
                         }
                     });
                 };
-                addWatcher(_t.signal, function receiveSignal(signal) {
-                    if (signal.recipient !== client || signal.sender !== shareVar) {
+                addWatcher.call(that, _t.signal, function receiveSignal(signal) {
+                    if (signal.recipient !== client || signal.sender !== shareloc) {
                         return;
                     }
                     handler.receiveSignal(signal.data);
-                    hub.post({
+                    that.post({
                         _id: signal._id,
                         _rev: signal._rev,
                         _deleted: true
-                    }, function (e) {
-                        if (e) {
-                            console.warn("Couldn't clean up signal", e);
+                    }, function (err) {
+                        if (err) {
+                            console.warn("Couldn't clean up signal", err);
                         }
                     });
                 });
+
                 return handler;     /* for .onreceivemessage and .sendMessage use */
             };
         }
@@ -686,29 +731,35 @@ SharePouch = function (hub) {
     };
 
     _isLocal = function (doc) {
+        if (typeof sharesByRemoteId !== 'object') {
+            return false;
+        }
         return sharesByRemoteId.hasOwnProperty(doc._id);
     };
 
     getShares = function (opts, cb) {
+        var that = this;
         if (typeof opts === 'function') {
             cb = opts;
             opts = {};
         }
         opts = opts || {};
         //hub.query(_t.ddoc_name+'/shares', {include_docs:true}, function (e, d) {
-        hub.allDocs({include_docs: true}, function (e, d) {
-            if (e) {
-                cb(e);
-            } else {
-                cb(null, d.rows.filter(function (r) {
-                    return (r.doc.type === _t.share && !_isLocal(r.doc));
-                }).map(function (r) { return _localizeShare(r.doc); }));
+        this.allDocs({include_docs: true}, function (err, docs) {
+            if (err) {
+                cb(err);
+                return;
             }
+            cb(null, docs.rows.filter(function (r) {
+                return (r.doc.type === _t.share && !_isLocal(r.doc));
+            }).map(function (r) {
+                return _localizeShare.call(that, r.doc);
+            }));
         });
         if (opts.onChange) {            // WARNING/TODO: listener may get changes before cb returns initial list!
-            return addWatcher(_t.share, function (doc) {
+            return addWatcher.call(this, _t.share, function (doc) {
                 if (!_isLocal(doc)) {
-                    opts.onChange(_localizeShare(doc));
+                    opts.onChange(_localizeShare.call(that, doc));
                 }
             });
         }
@@ -723,11 +774,8 @@ SharePouch = function (hub) {
 
 PeerPouch._shareInitializersByName = Object.create(null);           // global connection between new PeerPouch (client) and source SharePouch (hub)
 
-SharePouch._delete = function () {};            // blindly called by Pouch.destroy
+SharePouch._delete = function () {};            // blindly called by PouchDB.destroy
 
+PouchDB.plugin(new SharePouch());
 
-Pouch.plugin('hub', SharePouch);
-
-
-
-Pouch.dbgPeerPouch = PeerPouch;
+PouchDB.dbgPeerPouch = PeerPouch;
