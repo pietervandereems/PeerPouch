@@ -8,7 +8,8 @@ var PeerPouch,
     RTCPeerConnection = window.mozRTCPeerConnection || window.RTCPeerConnection || window.webkitRTCPeerConnection,
     RTCSessionDescription = window.mozRTCSessionDescription || window.RTCSessionDescription || window.webkitRTCSessionDescription,
     RTCIceCandidate = window.mozRTCIceCandidate || window.RTCIceCandidate || window.webkitRTCIceCandidate,
-    PeerConnectionHandler;
+    PeerConnectionHandler,
+    SharePouch;
 
 // a couple additional errors we use
 PouchDB.Errors.NOT_IMPLEMENTED = {
@@ -172,6 +173,7 @@ RPCHandler.prototype.bootstrap = function () {
 
 // Implements the API for dealing with a PouchDB peer's database over WebRTC
 PeerPouch = function (opts, callback) {
+console.log('PeerPouch', opts);
     var _init,
         handler,
         api,
@@ -186,7 +188,7 @@ PeerPouch = function (opts, callback) {
 
     _init = PeerPouch._shareInitializersByName[opts.name];
     if (!_init) {
-        throw new Error("Unknown PeerPouch share dbname");      // TODO: use callback instead?
+        throw new Error("Unknown PeerPouch share dbname " + opts.name);      // TODO: use callback instead?
     }
 
     handler = _init(opts);
@@ -237,8 +239,8 @@ PeerPouch = function (opts, callback) {
 //                //       [it seems unnecessary: a replication with "api" is a replication with "rpcAPI"]
 //                return rpcAPI._id;
 //            };
-//             api._id = pouchdb.utils.topromise(function (callback) {
-//                 callback(null, rpcapi._id);
+//             api._id = PouchDB.utils.toPromise(function (callback) {
+//                 callback(null, rpcApi._id);
 //             });
             api._id = function () {
                 return PouchDB.utils.Promise.resolve(rpcAPI._id);
@@ -489,7 +491,7 @@ PeerConnectionHandler.prototype._tube = function () {      // TODO: refactor Pee
 };
 
 
-var SharePouch = function () {
+SharePouch = function () {
     // NOTE: this plugin's methods are intended for use only on a **hub** database
 
     // this chunk of code manages a combined _changes listener on hub for any share/signal(/etc.) watchers
@@ -679,6 +681,7 @@ var SharePouch = function () {
     };
 
     _localizeShare = function (doc) {
+console.log('_localizeShare', this.id(), doc.id); // this.id() returns a Promise, code needs to be altered to work with this
         var name = [this.id(), doc._id].map(encodeURIComponent).join('/'),
             that = this;
 
@@ -744,7 +747,7 @@ var SharePouch = function () {
             opts = {};
         }
         opts = opts || {};
-        //hub.query(PeerPouch._types.ddoc_name+'/shares', {include_docs:true}, function (e, d) {
+        //hub.query(PeerPouch._types.ddoc_name+'/shares', {include_docs:true}, function (e, d) 
         this.allDocs({include_docs: true}, function (err, docs) {
             if (err) {
                 cb(err);
