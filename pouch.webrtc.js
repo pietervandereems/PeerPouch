@@ -5,7 +5,10 @@
 
 var PeerPouch,
     RPCHandler,
-    _t;
+    RTCPeerConnection = window.mozRTCPeerConnection || window.RTCPeerConnection || window.webkitRTCPeerConnection,
+    RTCSessionDescription = window.mozRTCSessionDescription || window.RTCSessionDescription || window.webkitRTCSessionDescription,
+    RTCIceCandidate = window.mozRTCIceCandidate || window.RTCIceCandidate || window.webkitRTCIceCandidate,
+    PeerConnectionHandler;
 
 // a couple additional errors we use
 PouchDB.Errors.NOT_IMPLEMENTED = {
@@ -240,7 +243,6 @@ PeerPouch = function (opts, callback) {
             api._id = function () {
                 return PouchDB.utils.Promise.resolve(rpcAPI._id);
             };
-
             // now our api object is *actually* ready for use
             if (callback) {
                 callback(null, api);
@@ -318,17 +320,15 @@ PeerPouch._types = {
     share: 'com.stemstorage.peerpouch.share'
 };
 
-_t = PeerPouch._types;         // local alias for brevitation…
-
 // Register for our scheme
 PouchDB.adapter('webrtc', PeerPouch);
 
 
-var RTCPeerConnection = window.mozRTCPeerConnection || window.RTCPeerConnection || window.webkitRTCPeerConnection,
-    RTCSessionDescription = window.mozRTCSessionDescription || window.RTCSessionDescription || window.webkitRTCSessionDescription,
-    RTCIceCandidate = window.mozRTCIceCandidate || window.RTCIceCandidate || window.webkitRTCIceCandidate;
+RTCPeerConnection = window.mozRTCPeerConnection || window.RTCPeerConnection || window.webkitRTCPeerConnection,
+RTCSessionDescription = window.mozRTCSessionDescription || window.RTCSessionDescription || window.webkitRTCSessionDescription,
+RTCIceCandidate = window.mozRTCIceCandidate || window.RTCIceCandidate || window.webkitRTCIceCandidate;
 
-function PeerConnectionHandler(opts) {
+PeerConnectionHandler = function (opts) {
     opts.reliable = true;
     var cfg = {
             "iceServers": [
@@ -529,7 +529,7 @@ var SharePouch = function () {
                     throw new Error(err);
                 }
                 opts = {
-                    //filter: _t.ddoc_name+'/signalling',             // see https://github.com/daleharvey/pouchdb/issues/525
+                    //filter: PeerPouch.PeerPouch._types.ddoc_name+'/signalling',             // see https://github.com/daleharvey/pouchdb/issues/525
                     include_docs: true,
                     continuous: true,
                     since: info.update_seq
@@ -582,7 +582,7 @@ var SharePouch = function () {
 
         shareObj = {
             _id: 'share-' + PouchDB.utils.uuid(),
-            type: _t.share,
+            type: PeerPouch._types.share,
             name: opts.name || null,
             info: opts.info || null
         };
@@ -597,7 +597,7 @@ var SharePouch = function () {
         });
 
         peerHandlers = Object.create(null);
-        shareObj._signalWatcher = addWatcher.call(that, _t.signal, function receiveSignal(signal) {
+        shareObj._signalWatcher = addWatcher.call(that, PeerPouch._types.signal, function receiveSignal(signal) {
             var self = shareObj._id,
                 peer = signal.sender,
                 info = signal.info,
@@ -612,7 +612,7 @@ var SharePouch = function () {
                 handler.onhavesignal = function sendSignal(evt) {
                     that.post({
                         _id: 's-signal-' + PouchDB.utils.uuid(),
-                        type: _t.signal,
+                        type: PeerPouch._types.signal,
                         sender: self,
                         recipient: peer,
                         data: evt.signal,
@@ -696,7 +696,7 @@ var SharePouch = function () {
                 handler.onhavesignal = function sendSignal(evt) {
                     that.post({
                         _id: 'p-signal-' + PouchDB.utils.uuid(),
-                        type: _t.signal,
+                        type: PeerPouch._types.signal,
                         sender: client,
                         recipient: shareloc,
                         data: evt.signal,
@@ -707,7 +707,7 @@ var SharePouch = function () {
                         }
                     });
                 };
-                addWatcher.call(that, _t.signal, function receiveSignal(signal) {
+                addWatcher.call(that, PeerPouch._types.signal, function receiveSignal(signal) {
                     if (signal.recipient !== client || signal.sender !== shareloc) {
                         return;
                     }
@@ -744,20 +744,20 @@ var SharePouch = function () {
             opts = {};
         }
         opts = opts || {};
-        //hub.query(_t.ddoc_name+'/shares', {include_docs:true}, function (e, d) {
+        //hub.query(PeerPouch._types.ddoc_name+'/shares', {include_docs:true}, function (e, d) {
         this.allDocs({include_docs: true}, function (err, docs) {
             if (err) {
                 cb(err);
                 return;
             }
             cb(null, docs.rows.filter(function (r) {
-                return (r.doc.type === _t.share && !_isLocal(r.doc));
+                return (r.doc.type === PeerPouch._types.share && !_isLocal(r.doc));
             }).map(function (r) {
                 return _localizeShare.call(that, r.doc);
             }));
         });
         if (opts.onChange) {            // WARNING/TODO: listener may get changes before cb returns initial list!
-            return addWatcher.call(this, _t.share, function (doc) {
+            return addWatcher.call(this, PeerPouch._types.share, function (doc) {
                 if (!_isLocal(doc)) {
                     opts.onChange(_localizeShare.call(that, doc));
                 }
